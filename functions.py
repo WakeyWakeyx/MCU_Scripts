@@ -2,7 +2,7 @@ from time import sleep, time
 from machine import SoftI2C, Pin
 from utime import ticks_diff, ticks_us, ticks_ms
 from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
-
+from icm20948.icm20948 import icm20948
 
 # I2C software instance for sensors
 i2c = SoftI2C(
@@ -189,6 +189,83 @@ def read_temp(i2c):
     humidity = 100 * humidity_bytes / 0x100000
     print(f"the temp: {temperature:.2f}")
     print(f"the humidity: {humidity:.2f}%")
+
+class IMUTracker:
+    """
+    Wraps the ICM20948 and provides delta acceleration in 1/64g units.
+    """
+    def __init__(self, imu, scale=64, dbg=0):
+        self.imu = imu
+        self.scale = scale
+        self.dbg = dbg
+        self._prev_acc = None
+
+    def reset_baseline(self):
+        """Force next delta to be (0,0,0)."""
+        self._prev_acc = None
+
+    def get_delta_64g(self):
+        ax, ay, az = self.imu.acc  
+
+        if self._prev_acc is None:
+            self._prev_acc = (ax, ay, az)
+            return 0, 0, 0
+
+        px, py, pz = self._prev_acc
+        dx = int((ax - px) * self.scale)
+        dy = int((ay - py) * self.scale)
+        dz = int((az - pz) * self.scale)
+
+        self._prev_acc = (ax, ay, az)
+
+        if self.dbg:
+            print("acc(g):", ax, ay, az, "prev:", px, py, pz, "delta:", dx, dy, dz)
+
+        return dx, dy, dz
+
+
+def IMU_init(i2c, dbg=0):
+    imu = icm20948(i2c, debug=0)  
+
+
+    try:
+        imu.set_acc_full_scale(4)       # ±4g
+        imu.set_acc_sample_rate(56.25)  
+    except AttributeError:
+        pass
+
+    tracker = IMUTracker(imu, dbg=dbg)  
+    print("IMU initialized (ICM20948)")
+    return tracker
+
+
+def run_sleep_tracker(tracker, print_interval_ms=1000):
+    """
+    Handles 32Hz background sampling and reports every 1 second.
+    """
+    SAMPLE_INTERVAL_MS = 31  # 32Hz precision
+    
+    last_sample = ticks_ms()
+    last_print = ticks_ms()
+    
+    print(f"Sampling: 32Hz, Reporting: {print_interval_ms}ms")
+
+    while True:
+        now = ticks_ms()
+
+        # 32Hz Sampling
+        if ticks_diff(now, last_sample) >= SAMPLE_INTERVAL_MS:
+            dx, dy, dz = tracker.get_delta_64g()
+            last_sample = now
+
+            # print every 1 second 
+            if ticks_diff(now, last_print) >= print_interval_ms:
+                
+                print("dx:{:4d} | dy:{:4d} | dz:{:4d}".format(dx, dy, dz))
+                last_print = now
+
+        
+        sleep_ms(1)
 
 #example on how to call in script:
 '''
