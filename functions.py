@@ -1,13 +1,13 @@
 from time import sleep, time
 from machine import SoftI2C, Pin
-from utime import ticks_diff, ticks_us, ticks_ms
+from utime import ticks_diff, ticks_us, ticks_ms, sleep_ms
 from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
-from icm20948.icm20948 import icm20948
+from icm20948 import ICM20948
 
 # I2C software instance for sensors
 i2c = SoftI2C(
-    sda=Pin(11,pull=Pin.PULL_UP),
-    scl=Pin(12,pull=Pin.PULL_UP),
+    sda=Pin(12,pull=Pin.PULL_UP),
+    scl=Pin(13,pull=Pin.PULL_UP),
     freq=400000,
 )
 
@@ -225,7 +225,7 @@ class IMUTracker:
 
 
 def IMU_init(i2c, dbg=0):
-    imu = icm20948(i2c, debug=0)  
+    imu = ICM20948(i2c, debug=0)  
 
 
     try:
@@ -266,9 +266,32 @@ def run_sleep_tracker(tracker, print_interval_ms=1000):
 
         
         sleep_ms(1)
-
-#example on how to call in script:
 '''
+def main():
+    print("Starting IMU Sleep Tracker")
+
+    # Initialize IMU + tracker
+    try:
+        tracker = IMU_init(i2c, dbg=0)
+    except Exception as e:
+        print("IMU init failed:", e)
+        return
+
+    # Allow sensor to stabilize
+    print("Stabilizing IMU")
+    sleep_ms(500)
+
+    # Reset baseline(0,0,0)
+    tracker.reset_baseline()
+    print("Baseline set.")
+
+    
+    try:
+        run_sleep_tracker(tracker, print_interval_ms=1000)
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+
+
 def main():
 
     sensor = MAX30102(i2c=i2c)
