@@ -140,19 +140,26 @@ def HRT_reading_init(sensor, i2c,sensor_sample_rate=200, sensor_fifo_average=8):
     hr_compute_interval = 1  # seconds
     return hr_monitor, hr_compute_interval
 
-def all_sensor_readings(sensor,hr_monitor,i2c,hr_compute_interval):
+def all_sensor_readings(hrsensor,hr_monitor,i2c,hr_compute_interval,
+tracker):
     ref_time = ticks_ms()  # Reference time
+
+    #sleep tracker constants
+    SAMPLE_INTERVAL_MS = 31  # 32Hz precision
+    last_sample = ticks_ms()
+
+    print(f"Sampling: 32Hz")
     while True:
         # The check() method has to be continuously polled, to check if
         # there are new readings into the sensor's FIFO queue. When new
         # readings are available, this function will put them into the storage.
-        sensor.check()
+        hrsensor.check()
 
         # Check if the storage contains available samples
-        if sensor.available():
+        if hrsensor.available():
             # Access the storage FIFO and gather the readings (integers)
-            red_reading = sensor.pop_red_from_storage()
-            ir_reading = sensor.pop_ir_from_storage()
+            red_reading = hrsensor.pop_red_from_storage()
+            ir_reading = hrsensor.pop_ir_from_storage()
 
             # Add the IR reading to the heart rate monitor
             # Note: based on the skin color, the red, IR or green LED can be used
@@ -164,12 +171,22 @@ def all_sensor_readings(sensor,hr_monitor,i2c,hr_compute_interval):
             # Calculate the heart rate
             heart_rate = hr_monitor.calculate_heart_rate()
             read_temp(i2c)
+
             if heart_rate is not None:
                 print("Heart Rate: {:.0f} BPM".format(heart_rate))
             else:
                 print("Not enough data to calculate heart rate")
             # Reset the reference time
             ref_time = ticks_ms()
+
+        #acc readings
+        now = ticks_ms()
+        # 32Hz Sampling
+        if ticks_diff(now, last_sample) >= SAMPLE_INTERVAL_MS:
+            dx, dy, dz = tracker.get_delta_64g()
+            last_sample = now
+            print("dx:{:4d} | dy:{:4d} | dz:{:4d}".format(dx, dy, dz))
+
 
 
 def read_temp(i2c):
@@ -225,57 +242,15 @@ class IMUTracker:
 
 
 def IMU_init(i2c, dbg=0):
-    imu = ICM20948(i2c, debug=0)  
-
-
+    imu = ICM20948(i2c, debug=0)
     try:
-        imu.set_acc_full_scale(4)       # ±4g
-        imu.set_acc_sample_rate(56.25)  
+        imu.set_acc_full_scale(4) #±4g
+        imu.set_acc_sample_rate(56.25)
     except AttributeError:
         pass
 
-    tracker = IMUTracker(imu, dbg=dbg)  
+    tracker = IMUTracker(imu, dbg=dbg)
     print("IMU initialized (ICM20948)")
-    return tracker
-
-
-def run_sleep_tracker(tracker, print_interval_ms=1000):
-    """
-    Handles 32Hz background sampling and reports every 1 second.
-    """
-    SAMPLE_INTERVAL_MS = 31  # 32Hz precision
-    
-    last_sample = ticks_ms()
-    last_print = ticks_ms()
-    
-    print(f"Sampling: 32Hz, Reporting: {print_interval_ms}ms")
-
-    while True:
-        now = ticks_ms()
-
-        # 32Hz Sampling
-        if ticks_diff(now, last_sample) >= SAMPLE_INTERVAL_MS:
-            dx, dy, dz = tracker.get_delta_64g()
-            last_sample = now
-
-            # print every 1 second 
-            if ticks_diff(now, last_print) >= print_interval_ms:
-                
-                print("dx:{:4d} | dy:{:4d} | dz:{:4d}".format(dx, dy, dz))
-                last_print = now
-
-        
-        sleep_ms(1)
-'''
-def main():
-    print("Starting IMU Sleep Tracker")
-
-    # Initialize IMU + tracker
-    try:
-        tracker = IMU_init(i2c, dbg=0)
-    except Exception as e:
-        print("IMU init failed:", e)
-        return
 
     # Allow sensor to stabilize
     print("Stabilizing IMU")
@@ -284,22 +259,41 @@ def main():
     # Reset baseline(0,0,0)
     tracker.reset_baseline()
     print("Baseline set.")
-
-    
-    try:
-        run_sleep_tracker(tracker, print_interval_ms=1000)
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
+    return tracker
 
 
-def main():
 
-    sensor = MAX30102(i2c=i2c)
-    hr_monitor,hr_compute_interval = HRT_reading_init(sensor,i2c)
-    all_sensor_readings(sensor,hr_monitor,i2c,hr_compute_interval)
+def run_sleep_tracker(tracker, print_interval_ms=1000):
 
+    SAMPLE_INTERVAL_MS = 31  # 32Hz precision
 
-if __name__ == "__main__":
-    main()
+    last_sample = ticks_ms()
+    last_print = ticks_ms()
+
+    print(f"Sampling: 32Hz")
+
+    while True:
+        now = ticks_ms()
+        # 32Hz Sampling
+        if ticks_diff(now, last_sample) >= SAMPLE_INTERVAL_MS:
+            dx, dy, dz = tracker.get_delta_64g()
+            last_sample = now
+
+            # print every 1 second
+            if ticks_diff(now, last_print) >= print_interval_ms:
+
+                print("dx:{:4d} | dy:{:4d} | dz:{:4d}".format(dx, dy, dz))
+                last_print = now
+                
 '''
+Continuous Reading from all sensors example:
+
+# Initialize IMU + tracker
+tracker = IMU_init(i2c)
+sensor = MAX30102(i2c=i2c)
+hr_monitor,hr_compute_interval = HRT_reading_init(sensor,i2c)
+all_sensor_readings(sensor,hr_monitor,i2c,hr_compute_interval,tracker)
+
+'''
+
 
