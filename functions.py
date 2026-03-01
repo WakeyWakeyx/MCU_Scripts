@@ -115,6 +115,7 @@ def HRT_reading_init(sensor, i2c,sensor_sample_rate=200, sensor_fifo_average=8):
 
     # Set LED brightness to a medium value
     sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM) #test both HIGH and MEDIUM
+    sensor.set_led_mode(2)
 
     # Expected acquisition rate: 400 Hz / 8 = 50 Hz
     actual_acquisition_rate = int(sensor_sample_rate / sensor_fifo_average)
@@ -164,7 +165,7 @@ tracker):
             # Add the IR reading to the heart rate monitor
             # Note: based on the skin color, the red, IR or green LED can be used
             # to calculate the heart rate with more accuracy.
-            hr_monitor.add_sample(ir_reading)
+            hr_monitor.add_sample((ir_reading+red_reading)/2)
 
         # Periodically calculate the heart rate every `hr_compute_interval` seconds
         if ticks_diff(ticks_ms(), ref_time) / 1000 > hr_compute_interval:
