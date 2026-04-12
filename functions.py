@@ -1,8 +1,68 @@
-from time import sleep, time
 from machine import SoftI2C, Pin
+from time import sleep, time
 from utime import ticks_diff, ticks_us, ticks_ms, sleep_ms
-from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
+from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM,MAX30105_PULSE_AMP_HIGH
 from icm20948 import ICM20948
+import json
+import bluetooth
+import struct
+
+#-- BLE setup --
+_UART_UUID = bluetooth.UUID('6E400001-B5A3-F393-E0A9-E50E24DCCA9E')
+_UART_TX = (bluetooth.UUID('6E400003-B5A3-F393-E0A9-E50E24DCCA9E'), bluetooth.FLAG_NOTIFY)
+_UART_RX = (bluetooth.UUID('6E400002-B5A3-F393-E0A9-E50E24DCCA9E'), bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE)
+_UART_SERVICE = (_UART_UUID, (_UART_TX, _UART_RX))
+
+class BLEPeripheral:
+    def __init__(self, name="Nano_ESP32"):
+        self._ble = bluetooth.BLE()
+        self._ble.active(True)
+        self._ble.irq(self._irq)
+        ((self._handle_tx, self._handle_rx),) = self._ble.gatts_register_services((_UART_SERVICE,))
+        self._connections = set()
+        self._payload = self._build_advertising_payload(name=name, services=[_UART_UUID])
+        self._advertise()
+
+    def _irq(self, event, data):
+        if event == 1: # _IRQ_CENTRAL_CONNECT
+            conn_handle, _, _ = data
+            self._connections.add(conn_handle)
+            print("BLE Connected")
+        elif event == 2: # _IRQ_CENTRAL_DISCONNECT
+            conn_handle, _, _ = data
+            self._connections.remove(conn_handle)
+            print("BLE Disconnected")
+            self._advertise()
+
+    def _advertise(self):
+        self._ble.gap_advertise(500000,self._payload)
+        print("BLE Advertising...")
+
+    def _build_advertising_payload(self, name, services):
+        payload = bytearray()
+        def _append(adv_type, value):
+            nonlocal payload
+            payload += struct.pack('BB', len(value) + 1, adv_type) + value
+
+        _append(0x09, name.encode()) # Name
+        for uuid in services:
+            b = bytes(uuid)
+            _append(0x07 if len(b) == 16 else 0x03, b) # Service UUID
+        return payload
+
+    def send(self, data):
+        if not self._connections:
+            return
+        if isinstance(data, str):
+            data = data.encode()
+        for conn_handle in self._connections:
+            # Send in 20-byte chunks to respect default BLE MTU
+            for i in range(0, len(data), 20):
+                self._ble.gatts_notify(conn_handle, self._handle_tx, data[i:i+20])
+    def is_connected(self):
+        return len(self._connections) > 0
+
+
 
 # I2C software instance for sensors
 i2c = SoftI2C(
@@ -141,43 +201,39 @@ def HRT_reading_init(sensor, i2c,sensor_sample_rate=200, sensor_fifo_average=8):
     hr_compute_interval = 1  # seconds
     return hr_monitor, hr_compute_interval
 
-def all_sensor_readings(hrsensor,hr_monitor,i2c,hr_compute_interval,
-tracker):
+def all_sensor_readings(hrsensor, hr_monitor, i2c, hr_compute_interval, tracker, ble):
     ref_time = ticks_ms()  # Reference time
-
-    #sleep tracker constants
     SAMPLE_INTERVAL_MS = 31  # 32Hz precision
     last_sample = ticks_ms()
+    temp = 0.0
+    humidity = 0.0
+    heart_rate = 0.0
 
     print(f"Sampling: 32Hz")
     while True:
-        # The check() method has to be continuously polled, to check if
-        # there are new readings into the sensor's FIFO queue. When new
-        # readings are available, this function will put them into the storage.
+        # Check if BLE is connected
+        if not ble.is_connected():
+            ref_time = ticks_ms()
+            last_sample = ticks_ms()
+            sleep_ms(100) # Sleep for 100ms to prevent CPU hogging
+            continue # Skip the rest of the loop until connected
+
+        # The check() method has to be continuously polled
         hrsensor.check()
 
         # Check if the storage contains available samples
         if hrsensor.available():
-            # Access the storage FIFO and gather the readings (integers)
             red_reading = hrsensor.pop_red_from_storage()
             ir_reading = hrsensor.pop_ir_from_storage()
-
-            # Add the IR reading to the heart rate monitor
-            # Note: based on the skin color, the red, IR or green LED can be used
-            # to calculate the heart rate with more accuracy.
             hr_monitor.add_sample((ir_reading+red_reading)/2)
 
-        # Periodically calculate the heart rate every `hr_compute_interval` seconds
+        # Periodically calculate the heart rate
         if ticks_diff(ticks_ms(), ref_time) / 1000 > hr_compute_interval:
-            # Calculate the heart rate
             heart_rate = hr_monitor.calculate_heart_rate()
-            read_temp(i2c)
+            temp, humidity = read_temp(i2c)
 
-            if heart_rate is not None:
-                print("Heart Rate: {:.0f} BPM".format(heart_rate))
-            else:
-                print("Not enough data to calculate heart rate")
-            # Reset the reference time
+            if heart_rate is None:
+                heart_rate = -1
             ref_time = ticks_ms()
 
         #acc readings
@@ -186,7 +242,18 @@ tracker):
         if ticks_diff(now, last_sample) >= SAMPLE_INTERVAL_MS:
             dx, dy, dz = tracker.get_delta_64g()
             last_sample = now
-            print("dx:{:4d} | dy:{:4d} | dz:{:4d}".format(dx, dy, dz))
+
+            data = {
+                "temperature": temp,
+                "humidity": humidity,
+                "heart_rate": heart_rate,
+                "accelerometer": {"x": dx, "y": dy, "z": dz}
+            }
+            #newline for the receiver
+            json_payload = json.dumps(data) + "\n"
+            ble.send(json_payload)
+            print(json_payload.strip())
+
 
 
 
@@ -199,14 +266,13 @@ def read_temp(i2c):
 
     read_status = data[0] >> 7
     if read_status:
-        return None
+        return -1,-1
 
     humidity_bytes = (data[1] << 12) | (data[2] << 4) | (data[3] >> 4)
     temp_byte = (data[3] & 0x0F) << 16 | (data[4] << 8) | data[5]
     temperature = temp_byte * 200.0 / 0x100000 - 50
     humidity = 100 * humidity_bytes / 0x100000
-    print(f"the temp: {temperature:.2f}")
-    print(f"the humidity: {humidity:.2f}%")
+    return temperature, humidity
 
 class IMUTracker:
     """
@@ -289,11 +355,26 @@ def run_sleep_tracker(tracker, print_interval_ms=1000):
 '''
 Continuous Reading from all sensors example:
 
-# Initialize IMU + tracker
-tracker = IMU_init(i2c)
-sensor = MAX30102(i2c=i2c)
-hr_monitor,hr_compute_interval = HRT_reading_init(sensor,i2c)
-all_sensor_readings(sensor,hr_monitor,i2c,hr_compute_interval,tracker)
+def main():
+
+    print("Starting Sensors")
+
+    # Initialize IMU + tracker
+    tracker = IMU_init(i2c)
+    sensor = MAX30102(i2c=i2c)
+    hr_monitor,hr_compute_interval = HRT_reading_init(sensor,i2c)
+    print("Initializing BLE...")
+    ble_module = BLEPeripheral(name="Nano_ESP32")
+
+    #NOTE: the default setting is with the red+ir sensors they work the best.
+    #I also set the frequency and sampling rate for the heart sensor to work best for me - Marwan
+
+    all_sensor_readings(sensor,hr_monitor,i2c,hr_compute_interval,tracker,ble_module)
+
+
+if __name__ == "__main__":
+    main()
+
 
 '''
 
