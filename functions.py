@@ -1,78 +1,95 @@
-from machine import SoftI2C, Pin
-from time import sleep, time
-from utime import ticks_diff, ticks_us, ticks_ms, sleep_ms
-from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM,MAX30105_PULSE_AMP_HIGH
-from icm20948 import ICM20948
 import json
-import bluetooth
 import struct
+from time import sleep, time
+import gc
+import bluetooth
+from icm20948 import ICM20948
+from machine import Pin, SoftI2C
+from max30102 import MAX30102, MAX30105_PULSE_AMP_HIGH, MAX30105_PULSE_AMP_MEDIUM
+from utime import sleep_ms, ticks_diff, ticks_ms, ticks_us
 
-#-- BLE setup --
-_UART_UUID = bluetooth.UUID('6E400001-B5A3-F393-E0A9-E50E24DCCA9E')
-_UART_TX = (bluetooth.UUID('6E400003-B5A3-F393-E0A9-E50E24DCCA9E'), bluetooth.FLAG_NOTIFY)
-_UART_RX = (bluetooth.UUID('6E400002-B5A3-F393-E0A9-E50E24DCCA9E'), bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE)
+# -- BLE setup --
+_UART_UUID = bluetooth.UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+_UART_TX = (
+    bluetooth.UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"),
+    bluetooth.FLAG_NOTIFY,
+)
+_UART_RX = (
+    bluetooth.UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"),
+    bluetooth.FLAG_WRITE | bluetooth.FLAG_WRITE_NO_RESPONSE,
+)
 _UART_SERVICE = (_UART_UUID, (_UART_TX, _UART_RX))
+
 
 class BLEPeripheral:
     def __init__(self, name="Nano_ESP32"):
         self._ble = bluetooth.BLE()
         self._ble.active(True)
         self._ble.irq(self._irq)
-        ((self._handle_tx, self._handle_rx),) = self._ble.gatts_register_services((_UART_SERVICE,))
+        ((self._handle_tx, self._handle_rx),) = self._ble.gatts_register_services(
+            (_UART_SERVICE,)
+        )
         self._connections = set()
-        self._payload = self._build_advertising_payload(name=name, services=[_UART_UUID])
+        self._payload = self._build_advertising_payload(
+            name=name, services=[_UART_UUID]
+        )
         self._advertise()
 
     def _irq(self, event, data):
-        if event == 1: # _IRQ_CENTRAL_CONNECT
+        if event == 1:  # _IRQ_CENTRAL_CONNECT
             conn_handle, _, _ = data
             self._connections.add(conn_handle)
             print("BLE Connected")
-        elif event == 2: # _IRQ_CENTRAL_DISCONNECT
+        elif event == 2:  # _IRQ_CENTRAL_DISCONNECT
             conn_handle, _, _ = data
             self._connections.remove(conn_handle)
             print("BLE Disconnected")
             self._advertise()
 
     def _advertise(self):
-        self._ble.gap_advertise(500000,self._payload)
+        self._ble.gap_advertise(500000, self._payload)
         print("BLE Advertising...")
 
     def _build_advertising_payload(self, name, services):
         payload = bytearray()
+
         def _append(adv_type, value):
             nonlocal payload
-            payload += struct.pack('BB', len(value) + 1, adv_type) + value
+            payload += struct.pack("BB", len(value) + 1, adv_type) + value
 
-        _append(0x09, name.encode()) # Name
+        _append(0x09, name.encode())  # Name
         for uuid in services:
             b = bytes(uuid)
-            _append(0x07 if len(b) == 16 else 0x03, b) # Service UUID
+            _append(0x07 if len(b) == 16 else 0x03, b)  # Service UUID
         return payload
 
     def send(self, data):
         if not self._connections:
             return
-        if isinstance(data, str):
-            data = data.encode()
-        for conn_handle in self._connections:
-            # Send in 20-byte chunks to respect default BLE MTU
-            for i in range(0, len(data), 20):
-                self._ble.gatts_notify(conn_handle, self._handle_tx, data[i:i+20])
+        try:
+            if isinstance(data, str):
+                data = data.encode()
+            for conn_handle in self._connections:
+                for i in range(0, len(data), 256):
+                    self._ble.gatts_notify(conn_handle, self._handle_tx, data[i : i + 256])
+        except (OSError, MemoryError):
+            # Drop the packet silently if the BLE buffer is full or RAM is exhausted
+            return
+
     def is_connected(self):
         return len(self._connections) > 0
 
 
-
-# I2C software instance for sensors
 i2c = SoftI2C(
-    sda=Pin(12,pull=Pin.PULL_UP),
-    scl=Pin(13,pull=Pin.PULL_UP),
+    sda=Pin(11, pull=Pin.PULL_UP),
+    scl=Pin(12, pull=Pin.PULL_UP),
     freq=400000,
 )
 
+
 class HeartRateMonitor:
     """A simple heart rate monitor that uses a moving window to smooth the signal and find peaks."""
+
     def __init__(self, sample_rate=200, window_size=10, smoothing_window=5):
         self.sample_rate = sample_rate
         self.window_size = window_size
@@ -150,15 +167,16 @@ class HeartRateMonitor:
 
         return heart_rate
 
-def HRT_reading_init(sensor, i2c,sensor_sample_rate=200, sensor_fifo_average=8):
+
+def HRT_reading_init(sensor, i2c, sensor_sample_rate=200, sensor_fifo_average=8):
     # Scan I2C bus to ensure that the sensor is connected
     if sensor.i2c_address not in i2c.scan():
         print("Sensor not found.")
-        return
+        return None, None
     elif not (sensor.check_part_id()):
         # Check that the targeted sensor is compatible
         print("I2C device ID not corresponding to MAX30102 or MAX30105.")
-        return
+        return None, None
     else:
         print("Sensor connected and recognized.")
 
@@ -167,14 +185,16 @@ def HRT_reading_init(sensor, i2c,sensor_sample_rate=200, sensor_fifo_average=8):
     sensor.setup_sensor()
 
     # Set the sample rate to 400: 400 samples/s are collected by the sensor
-    #200 gave better results
+    # 200 gave better results
     sensor.set_sample_rate(sensor_sample_rate)
 
     # Set the number of samples to be averaged per each reading
     sensor.set_fifo_average(sensor_fifo_average)
 
     # Set LED brightness to a medium value
-    sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM) #test both HIGH and MEDIUM
+    sensor.set_active_leds_amplitude(
+        MAX30105_PULSE_AMP_HIGH
+    )  # test both HIGH and MEDIUM
     sensor.set_led_mode(2)
 
     # Expected acquisition rate: 400 Hz / 8 = 50 Hz
@@ -201,6 +221,7 @@ def HRT_reading_init(sensor, i2c,sensor_sample_rate=200, sensor_fifo_average=8):
     hr_compute_interval = 1  # seconds
     return hr_monitor, hr_compute_interval
 
+
 def all_sensor_readings(hrsensor, hr_monitor, i2c, hr_compute_interval, tracker, ble):
     ref_time = ticks_ms()  # Reference time
     SAMPLE_INTERVAL_MS = 31  # 32Hz precision
@@ -215,8 +236,8 @@ def all_sensor_readings(hrsensor, hr_monitor, i2c, hr_compute_interval, tracker,
         if not ble.is_connected():
             ref_time = ticks_ms()
             last_sample = ticks_ms()
-            sleep_ms(100) # Sleep for 100ms to prevent CPU hogging
-            continue # Skip the rest of the loop until connected
+            sleep_ms(100)  # Sleep for 100ms to prevent CPU hogging
+            continue  # Skip the rest of the loop until connected
 
         # The check() method has to be continuously polled
         hrsensor.check()
@@ -225,7 +246,7 @@ def all_sensor_readings(hrsensor, hr_monitor, i2c, hr_compute_interval, tracker,
         if hrsensor.available():
             red_reading = hrsensor.pop_red_from_storage()
             ir_reading = hrsensor.pop_ir_from_storage()
-            hr_monitor.add_sample((ir_reading+red_reading)/2)
+            hr_monitor.add_sample((ir_reading + red_reading) / 2)
 
         # Periodically calculate the heart rate
         if ticks_diff(ticks_ms(), ref_time) / 1000 > hr_compute_interval:
@@ -236,7 +257,7 @@ def all_sensor_readings(hrsensor, hr_monitor, i2c, hr_compute_interval, tracker,
                 heart_rate = -1
             ref_time = ticks_ms()
 
-        #acc readings
+        # acc readings
         now = ticks_ms()
         # 32Hz Sampling
         if ticks_diff(now, last_sample) >= SAMPLE_INTERVAL_MS:
@@ -247,14 +268,12 @@ def all_sensor_readings(hrsensor, hr_monitor, i2c, hr_compute_interval, tracker,
                 "temperature": temp,
                 "humidity": humidity,
                 "heart_rate": heart_rate,
-                "accelerometer": {"x": dx, "y": dy, "z": dz}
+                "accelerometer": {"x": dx, "y": dy, "z": dz},
             }
-            #newline for the receiver
+            # newline for the receiver
             json_payload = json.dumps(data) + "\n"
             ble.send(json_payload)
             print(json_payload.strip())
-
-
 
 
 def read_temp(i2c):
@@ -266,7 +285,7 @@ def read_temp(i2c):
 
     read_status = data[0] >> 7
     if read_status:
-        return -1,-1
+        return -1, -1
 
     humidity_bytes = (data[1] << 12) | (data[2] << 4) | (data[3] >> 4)
     temp_byte = (data[3] & 0x0F) << 16 | (data[4] << 8) | data[5]
@@ -274,10 +293,12 @@ def read_temp(i2c):
     humidity = 100 * humidity_bytes / 0x100000
     return temperature, humidity
 
+
 class IMUTracker:
     """
     Wraps the ICM20948 and provides delta acceleration in 1/64g units.
     """
+
     def __init__(self, imu, scale=64, dbg=0):
         self.imu = imu
         self.scale = scale
@@ -289,7 +310,7 @@ class IMUTracker:
         self._prev_acc = None
 
     def get_delta_64g(self):
-        ax, ay, az = self.imu.acc  
+        ax, ay, az = self.imu.acc
 
         if self._prev_acc is None:
             self._prev_acc = (ax, ay, az)
@@ -311,7 +332,7 @@ class IMUTracker:
 def IMU_init(i2c, dbg=0):
     imu = ICM20948(i2c, debug=0)
     try:
-        imu.set_acc_full_scale(4) #±4g
+        imu.set_acc_full_scale(4)  # ±4g
         imu.set_acc_sample_rate(56.25)
     except AttributeError:
         pass
@@ -327,7 +348,6 @@ def IMU_init(i2c, dbg=0):
     tracker.reset_baseline()
     print("Baseline set.")
     return tracker
-
 
 
 def run_sleep_tracker(tracker, print_interval_ms=1000):
@@ -351,9 +371,7 @@ def run_sleep_tracker(tracker, print_interval_ms=1000):
 
                 print("dx:{:4d} | dy:{:4d} | dz:{:4d}".format(dx, dy, dz))
                 last_print = now
-                
-'''
-Continuous Reading from all sensors example:
+
 
 def main():
 
@@ -362,20 +380,17 @@ def main():
     # Initialize IMU + tracker
     tracker = IMU_init(i2c)
     sensor = MAX30102(i2c=i2c)
-    hr_monitor,hr_compute_interval = HRT_reading_init(sensor,i2c)
+    hr_monitor, hr_compute_interval = HRT_reading_init(sensor, i2c)
     print("Initializing BLE...")
     ble_module = BLEPeripheral(name="Nano_ESP32")
 
-    #NOTE: the default setting is with the red+ir sensors they work the best.
-    #I also set the frequency and sampling rate for the heart sensor to work best for me - Marwan
+    # NOTE: the default setting is with the red+ir sensors they work the best.
+    # I also set the frequency and sampling rate for the heart sensor to work best for me - Marwan
 
-    all_sensor_readings(sensor,hr_monitor,i2c,hr_compute_interval,tracker,ble_module)
+    all_sensor_readings(
+        sensor, hr_monitor, i2c, hr_compute_interval, tracker, ble_module
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
-'''
-
-
